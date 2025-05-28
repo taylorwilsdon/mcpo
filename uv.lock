@@ -318,6 +318,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
     { name = "passlib", extra = ["bcrypt"] },
     { name = "pydantic" },
@@ -336,6 +337,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1.8" },
     { name = "fastapi", specifier = ">=0.115.12" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "mcp", specifier = ">=1.8.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.8.0" },
     { name = "passlib", extras = ["bcrypt"], specifier = ">=1.7.4" },
