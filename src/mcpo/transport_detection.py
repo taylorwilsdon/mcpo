@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import logging
-from typing import Tuple, Optional, NamedTuple # Added NamedTuple
+from typing import Tuple, Optional, NamedTuple, Any # Added NamedTuple and Any
 import asyncio # Added for asyncio.StreamReader/Writer/Process types
 import httpx # For making HTTP requests during probing
 
@@ -58,19 +58,19 @@ async def _probe_http(url: str, timeout: float = 3.0):
         logger.error(f"Unexpected error while probing {url}: {e}")
         raise
 
-async def _open_http(kind: str, url: str):
-    """Opens an HTTP/SSE connection based on the detected kind."""
-    logger.debug(f"Opening HTTP connection of kind '{kind}' to URL: {url}")
+def _get_http_context_manager(kind: str, url: str):
+    """Returns the appropriate HTTP context manager based on the detected kind."""
+    logger.debug(f"Getting HTTP context manager of kind '{kind}' for URL: {url}")
     if kind == "http-sse":
         # sse_client expects (reader, writer)
-        return await sse_client(url=url, sse_read_timeout=None) # Match existing sse_read_timeout
+        return sse_client(url=url, sse_read_timeout=None) # Match existing sse_read_timeout
     elif kind == "http-json":
         # streamablehttp_client expects (reader, writer, get_session_id_callback)
         # Ensure URL has trailing slash for streamablehttp_client if it's a convention
         http_url = url
         if not http_url.endswith("/"): # As per original logic for streamablehttp
             http_url = f"{http_url}/"
-        return await streamablehttp_client(url=http_url)
+        return streamablehttp_client(url=http_url)
     else:
         raise ValueError(f"Unknown HTTP kind: {kind}")
 
@@ -164,15 +164,15 @@ async def _open_stdio(proc: asyncio.subprocess.Process):
 
 # Define NamedTuple for the connect function's return type
 class ConnectResult(NamedTuple):
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+    context_manager: Any  # The async context manager to use
     proc: Optional[asyncio.subprocess.Process]
 
 
 async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float = 2.0) -> ConnectResult:
     """
     Connects to an MCP server based on the provided configuration.
-    Returns a ConnectResult NamedTuple (reader, writer, process_handle_or_none).
+    Returns a ConnectResult NamedTuple (context_manager, process_handle_or_none).
+    The context_manager should be used with 'async with' to get (reader, writer).
     """
     url = cfg.get("url")
     command = cfg.get("command")
@@ -202,8 +202,8 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
                 logger.debug(f"No valid type hint for URL {url}, probing transport.")
                 kind_to_open = await _probe_http(url, timeout=default_timeout)
 
-            reader, writer, *_ = await _open_http(kind_to_open, url) # _open_http might return 3 values
-            return ConnectResult(reader, writer, None) # No process started by us
+            context_manager = _get_http_context_manager(kind_to_open, url)
+            return ConnectResult(context_manager, None) # No process started by us
         except Exception as e:
             logger.error(f"Failed to connect to or probe direct URL {url}: {e}")
             raise
@@ -272,8 +272,8 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
                 await proc.wait() if proc else asyncio.sleep(0)
                 raise RuntimeError(f"Server '{command}' (PID: {proc.pid if proc else 'N/A'}) did not become ready/confirm type at {expected_url_for_command} after {max_retries} retries.")
 
-            reader, writer, *_ = await _open_http(kind_to_open, expected_url_for_command)
-            return ConnectResult(reader, writer, proc)
+            context_manager = _get_http_context_manager(kind_to_open, expected_url_for_command)
+            return ConnectResult(context_manager, proc)
         except Exception:
             if proc and proc.returncode is None: # Ensure process is killed on any error during setup
                 logger.warning(f"Error during setup for command-started server '{command}' (PID: {proc.pid}). Terminating process.")

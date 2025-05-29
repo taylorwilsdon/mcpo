@@ -133,18 +133,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # It raises ValueError for stdio configs that should be handled by the block above.
             # It might raise other errors if connection or process start fails.
             connect_result = await transport_connect(mcp_config)
-            reader = connect_result.reader
-            writer = connect_result.writer
+            context_manager = connect_result.context_manager
             server_proc = connect_result.proc  # transport_connect returns proc if it started one
 
-            if reader and writer:
-                async with ClientSession(reader, writer) as session:
-                    app.state.session = session
-                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
-                    yield
+            if context_manager:
+                async with context_manager as (reader, writer, *_):
+                    async with ClientSession(reader, writer) as session:
+                        app.state.session = session
+                        await create_dynamic_endpoints(app, api_dependency=api_dependency)
+                        yield
             else:
                 # Should not be reached if transport_connect behaves correctly
-                logger.error(f"Failed to obtain reader/writer from transport_connect for config: {mcp_config}")
+                logger.error(f"Failed to obtain context manager from transport_connect for config: {mcp_config}")
                 raise RuntimeError(f"Failed to connect using transport_detection for config: {mcp_config}")
 
         finally:
