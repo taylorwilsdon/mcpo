@@ -178,10 +178,14 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
     command = cfg.get("command")
     command_args = cfg.get("args", []) # Renamed from 'args' in cfg to avoid confusion
     command_env = cfg.get("env", {})
+    command_cwd = cfg.get("cwd")  # Extract cwd from config
     # 'type' can be a hint: 'sse', 'streamablehttp' (or 'streamable_http'), 'stdio'
     # 'expected_url' is for command-started HTTP/SSE servers.
     server_type_hint = cfg.get("type")
     expected_url_for_command = cfg.get("expected_url")
+
+    # Log the extracted configuration for debugging
+    logger.debug(f"Extracted config - command: {command}, args: {command_args}, cwd: {command_cwd}, env: {command_env}")
 
     proc = None # Store subprocess handle if we start one
 
@@ -193,7 +197,7 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
             kind_to_open = None
             if server_type_hint == "sse":
                 kind_to_open = "http-sse"
-            elif server_type_hint in ["streamablehttp", "streamable_http"]:
+            elif server_type_hint in ["streamablehttp", "streamable_http", "streamable-http"]:
                 kind_to_open = "http-json"
 
             if kind_to_open:
@@ -210,14 +214,35 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
 
     # Case 2: Command is provided to start an HTTP/SSE server (expected_url is key)
     elif command and expected_url_for_command:
-        logger.info(f"Starting server via command '{command}' with args '{command_args}', expecting URL '{expected_url_for_command}'")
+        logger.info(f"Starting server via command '{command}' with args '{command_args}' in cwd '{command_cwd}', expecting URL '{expected_url_for_command}'")
         try:
+            # Prepare subprocess kwargs
+            subprocess_kwargs = {
+                "stdout": asyncio.subprocess.PIPE,  # Capture for potential debugging
+                "stderr": asyncio.subprocess.PIPE,  # Capture for potential debugging or URL sniffing (if needed later)
+                "env": {**os.environ, **command_env}
+            }
+
+            # Add cwd if specified
+            if command_cwd:
+                subprocess_kwargs["cwd"] = command_cwd
+                logger.debug(f"Setting subprocess cwd to: {command_cwd}")
+
+                # Verify the directory exists
+                if not os.path.exists(command_cwd):
+                    logger.error(f"Working directory does not exist: {command_cwd}")
+                    raise FileNotFoundError(f"Working directory does not exist: {command_cwd}")
+
+                # Check if main.py exists in the directory
+                main_py_path = os.path.join(command_cwd, "main.py")
+                if command == "uv" and "main.py" in command_args and not os.path.exists(main_py_path):
+                    logger.error(f"main.py not found in {command_cwd}")
+                    raise FileNotFoundError(f"main.py not found in {command_cwd}")
+
             proc = await asyncio.create_subprocess_exec(
                 command,
                 *command_args,
-                stdout=asyncio.subprocess.PIPE, # Capture for potential debugging
-                stderr=asyncio.subprocess.PIPE, # Capture for potential debugging or URL sniffing (if needed later)
-                env={**os.environ, **command_env}
+                **subprocess_kwargs
             )
             logger.info(f"Server process for '{command}' started (PID: {proc.pid}). Waiting for it to be ready at {expected_url_for_command}...")
 
@@ -230,7 +255,7 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
             kind_to_open = None
             if server_type_hint == "sse":
                 kind_to_open = "http-sse"
-            elif server_type_hint in ["streamablehttp", "streamable_http"]:
+            elif server_type_hint in ["streamablehttp", "streamable_http", "streamable-http"]:
                 kind_to_open = "http-json"
 
             # Probe loop
@@ -244,7 +269,7 @@ async def connect(cfg: dict, default_timeout: float = 3.0, stdio_timeout: float 
                         probe_headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
                         response = await http_session.post(expected_url_for_command, json=INIT_PAYLOAD, headers=probe_headers)
 
-                        logger.debug(f"Health check POST to {expected_url_for_command} (attempt {attempt+1}): status {response.status}")
+                        logger.debug(f"Health check POST to {expected_url_for_command} (attempt {attempt+1}): status {response.status_code}")
                         response.raise_for_status() # Check for HTTP errors
 
                         # If kind_to_open was not hinted, determine it now

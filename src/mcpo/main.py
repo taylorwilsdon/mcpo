@@ -10,10 +10,9 @@ import asyncio
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client  # Still needed for direct stdio case
-# sse_client and streamablehttp_client are now used within transport_detection
+from mcp.client.stdio import stdio_client
 
-from .transport_detection import connect as transport_connect  # Renamed to avoid conflict
+from .transport_detection import connect as transport_connect
 from starlette.routing import Mount
 
 logger = logging.getLogger(__name__)
@@ -130,8 +129,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         writer = None
         try:
             # transport_connect will handle probing, starting process if needed, and returning reader/writer/proc
-            # It raises ValueError for stdio configs that should be handled by the block above.
-            # It might raise other errors if connection or process start fails.
             connect_result = await transport_connect(mcp_config)
             context_manager = connect_result.context_manager
             server_proc = connect_result.proc  # transport_connect returns proc if it started one
@@ -232,7 +229,7 @@ async def run(
         main_app.state.server_type = "sse"
         main_app.state.args = server_command[0]  # Expects URL as the first element
         main_app.state.api_dependency = api_dependency
-    elif server_type in ["streamablehttp", "streamable_http"]:
+    elif server_type in ["streamablehttp", "streamable_http", "streamable-http"]:
         logger.info(f"Configuring for a single StreamableHTTP MCP Server with URL {server_command[0]}")
         main_app.state.server_type = "streamablehttp"
         main_app.state.args = server_command[0]  # Expects URL as the first element
@@ -272,6 +269,11 @@ async def run(
         for server_name, server_cfg in mcp_servers.items():
             current_mcp_config = server_cfg.copy()
 
+            # Handle nested options structure - flatten it
+            if "options" in current_mcp_config:
+                options = current_mcp_config.pop("options")
+                current_mcp_config.update(options)
+
             # Basic validation: must have command or url
             if not current_mcp_config.get("command") and not current_mcp_config.get("url"):
                 logger.warning(f"Skipping server '{server_name}': configuration must include 'command' or 'url'.")
@@ -279,7 +281,7 @@ async def run(
 
             # Command-based HTTP/SSE requires 'expected_url'
             if (current_mcp_config.get("command") and
-                current_mcp_config.get("type") in ["sse", "streamablehttp", "streamable_http"] and
+                current_mcp_config.get("type") in ["sse", "streamablehttp", "streamable_http", "streamable-http"] and
                 not current_mcp_config.get("expected_url")):
                 logger.warning(f"Skipping server '{server_name}': command-based HTTP/SSE server requires 'expected_url'.")
                 continue
@@ -319,7 +321,7 @@ async def run(
                 cli_mcp_config["command"] = server_command[0]
                 cli_mcp_config["args"] = server_command[1:]
                 cli_mcp_config["env"] = os.environ.copy()  # Ensure current env is passed for stdio
-            elif server_type in ["sse", "streamablehttp", "streamable_http"]:
+            elif server_type in ["sse", "streamablehttp", "streamable_http", "streamable-http"]:
                 if not server_command or not isinstance(server_command[0], str):
                     raise ValueError(f"URL must be provided for {server_type} server via CLI.")
                 cli_mcp_config["url"] = server_command[0]
