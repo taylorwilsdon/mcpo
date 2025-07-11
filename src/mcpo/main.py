@@ -100,19 +100,40 @@ async def lifespan(app: FastAPI):
             successful_servers = []
             failed_servers = []
 
-            for route in app.routes:
-                if isinstance(route, Mount) and isinstance(route.app, FastAPI):
-                    try:
-                        await stack.enter_async_context(
-                            route.app.router.lifespan_context(route.app)
-                        )
-                        if getattr(route.app.state, "is_connected", False):
-                            successful_servers.append(route.app.title)
-                        else:
-                            failed_servers.append(route.app.title)
-                    except Exception as e:
-                        logger.error(f"Failed to start server '{route.app.title}': {e}")
-                        failed_servers.append(route.app.title)
+            async def start_server(route: Mount):
+                """Helper to start a server and capture its status."""
+                server_name = route.app.title
+                logger.info(f"Initiating connection for server: '{server_name}'...")
+                try:
+                    await stack.enter_async_context(
+                        route.app.router.lifespan_context(route.app)
+                    )
+                    is_connected = getattr(route.app.state, "is_connected", False)
+                    if is_connected:
+                        logger.info(f"Successfully connected to '{server_name}'.")
+                        return server_name, True
+                    else:
+                        # This case might happen if the connection fails inside the sub-lifespan without an exception
+                        logger.warning(f"Connection attempt for '{server_name}' finished, but status is not 'connected'.")
+                        return server_name, False
+                except Exception:
+                    # The specific error is already logged in the sub-app's lifespan
+                    logger.error(f"Failed to establish connection for server: '{server_name}'.")
+                    return server_name, False
+
+            tasks = [
+                start_server(route)
+                for route in app.routes
+                if isinstance(route, Mount) and isinstance(route.app, FastAPI)
+            ]
+
+            if tasks:
+                results = await asyncio.gather(*tasks)
+                for name, is_connected in results:
+                    if is_connected:
+                        successful_servers.append(name)
+                    else:
+                        failed_servers.append(name)
 
             logger.info("\n--- Server Startup Summary ---")
             if successful_servers:
@@ -132,15 +153,15 @@ async def lifespan(app: FastAPI):
                 logger.error("No MCP servers could be reached.")
 
             yield
+            # The AsyncExitStack will handle the graceful shutdown of all servers
+            # when the 'with' block is exited.
     else:
         # This is a sub-app's lifespan
         # This is a sub-app's lifespan
-        logger.info(f"[{app.title}] Lifespan: Entering...")
         app.state.is_connected = False
         try:
             # Wrap the entire connection attempt in a timeout
             async with asyncio.timeout(connection_timeout):
-                logger.info(f"[{app.title}] Lifespan: Attempting connection...")
                 if server_type == "stdio":
                     server_params = StdioServerParameters(
                         command=command,
@@ -160,20 +181,15 @@ async def lifespan(app: FastAPI):
                     raise ValueError(f"Unsupported server type: {server_type}")
 
                 async with client_context as (reader, writer, *_):
-                    logger.info(f"[{app.title}] Lifespan: Connection successful.")
                     async with ClientSession(reader, writer) as session:
                         app.state.session = session
                         await create_dynamic_endpoints(app, api_dependency=api_dependency)
                         app.state.is_connected = True
-                        logger.info(f"[{app.title}] Lifespan: Yielding control (connected).")
                         yield
         except (asyncio.TimeoutError, Exception) as e:
-            logger.error(f"[{app.title}] Lifespan: Exception caught - {e}")
+            logger.error(f"Failed to connect to MCP server '{app.title}' (timeout: {connection_timeout}s): {e}")
             app.state.is_connected = False
-            logger.info(f"[{app.title}] Lifespan: Yielding control (failed).")
-            yield  # Allow the app to continue without this server
-
-        logger.info(f"[{app.title}] Lifespan: Exiting...")
+            return # Correctly exit the generator
 
 
 async def run(
