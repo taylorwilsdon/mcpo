@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import signal
 import socket
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -88,64 +89,91 @@ async def lifespan(app: FastAPI):
     command = getattr(app.state, "command", None)
     args = getattr(app.state, "args", [])
     env = getattr(app.state, "env", {})
-
-    args = args if isinstance(args, list) else [args]
+    connection_timeout = getattr(app.state, "connection_timeout", 10)
     api_dependency = getattr(app.state, "api_dependency", None)
 
-    if (server_type == "stdio" and not command) or (
-        server_type == "sse" and not args[0]
-    ):
-        # Main app lifespan (when config_path is provided)
+    # This is the main app's lifespan, it orchestrates sub-apps
+    is_main_app = not command and not (server_type in ["sse", "streamablehttp", "streamable_http"] and args)
+
+    if is_main_app:
         async with AsyncExitStack() as stack:
+            successful_servers = []
+            failed_servers = []
+
             for route in app.routes:
                 if isinstance(route, Mount) and isinstance(route.app, FastAPI):
-                    await stack.enter_async_context(
-                        route.app.router.lifespan_context(route.app),  # noqa
-                    )
+                    try:
+                        await stack.enter_async_context(
+                            route.app.router.lifespan_context(route.app)
+                        )
+                        if getattr(route.app.state, "is_connected", False):
+                            successful_servers.append(route.app.title)
+                        else:
+                            failed_servers.append(route.app.title)
+                    except Exception as e:
+                        logger.error(f"Failed to start server '{route.app.title}': {e}")
+                        failed_servers.append(route.app.title)
+
+            logger.info("\n--- Server Startup Summary ---")
+            if successful_servers:
+                logger.info("Successfully connected to:")
+                for name in successful_servers:
+                    logger.info(f"  - {name}")
+                app.description += "\n\n- **available tools**："
+                for name in successful_servers:
+                    app.description += f"\n    - [{name}](/{name}/docs)"
+            if failed_servers:
+                logger.warning("Failed to connect to:")
+                for name in failed_servers:
+                    logger.warning(f"  - {name}")
+            logger.info("--------------------------\n")
+
+            if not successful_servers:
+                logger.error("No MCP servers could be reached.")
+
             yield
     else:
-        if server_type == "stdio":
-            server_params = StdioServerParameters(
-                command=command,
-                args=args,
-                env={**os.environ, **env},
-            )
+        # This is a sub-app's lifespan
+        # This is a sub-app's lifespan
+        logger.info(f"[{app.title}] Lifespan: Entering...")
+        app.state.is_connected = False
+        try:
+            # Wrap the entire connection attempt in a timeout
+            async with asyncio.timeout(connection_timeout):
+                logger.info(f"[{app.title}] Lifespan: Attempting connection...")
+                if server_type == "stdio":
+                    server_params = StdioServerParameters(
+                        command=command,
+                        args=args,
+                        env={**os.environ, **env},
+                    )
+                    client_context = stdio_client(server_params)
+                elif server_type == "sse":
+                    headers = getattr(app.state, "headers", None)
+                    client_context = sse_client(
+                        url=args[0], sse_read_timeout=connection_timeout, headers=headers
+                    )
+                elif server_type == "streamablehttp" or server_type == "streamable_http":
+                    headers = getattr(app.state, "headers", None)
+                    client_context = streamablehttp_client(url=args[0], headers=headers)
+                else:
+                    raise ValueError(f"Unsupported server type: {server_type}")
 
-            async with stdio_client(server_params) as (reader, writer):
-                async with ClientSession(reader, writer) as session:
-                    app.state.session = session
-                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
-                    yield
-        if server_type == "sse":
-            headers = getattr(app.state, "headers", None)
-            async with sse_client(
-                url=args[0], sse_read_timeout=None, headers=headers
-            ) as (
-                reader,
-                writer,
-            ):
-                async with ClientSession(reader, writer) as session:
-                    app.state.session = session
-                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
-                    yield
-        if server_type == "streamablehttp" or server_type == "streamable_http":
-            headers = getattr(app.state, "headers", None)
+                async with client_context as (reader, writer, *_):
+                    logger.info(f"[{app.title}] Lifespan: Connection successful.")
+                    async with ClientSession(reader, writer) as session:
+                        app.state.session = session
+                        await create_dynamic_endpoints(app, api_dependency=api_dependency)
+                        app.state.is_connected = True
+                        logger.info(f"[{app.title}] Lifespan: Yielding control (connected).")
+                        yield
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.error(f"[{app.title}] Lifespan: Exception caught - {e}")
+            app.state.is_connected = False
+            logger.info(f"[{app.title}] Lifespan: Yielding control (failed).")
+            yield  # Allow the app to continue without this server
 
-            # Ensure URL has trailing slash to avoid redirects
-            url = args[0]
-            if not url.endswith("/"):
-                url = f"{url}/"
-
-            # Connect using streamablehttp_client from the SDK, similar to sse_client
-            async with streamablehttp_client(url=url, headers=headers) as (
-                reader,
-                writer,
-                _,  # get_session_id callback not needed for ClientSession
-            ):
-                async with ClientSession(reader, writer) as session:
-                    app.state.session = session
-                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
-                    yield
+        logger.info(f"[{app.title}] Lifespan: Exiting...")
 
 
 async def run(
@@ -157,6 +185,7 @@ async def run(
 ):
     # Server API Key
     api_dependency = get_verify_api_key(api_key) if api_key else None
+    connection_timeout = kwargs.get("connection_timeout", 10)
     strict_auth = kwargs.get("strict_auth", False)
 
     # MCP Server
@@ -261,40 +290,7 @@ async def run(
             logger.error(f"No 'mcpServers' found in config file: {config_path}")
             raise ValueError("No 'mcpServers' found in config file.")
 
-        logger.info("Configured MCP Servers:")
-        for server_name_cfg, server_cfg_details in mcp_servers.items():
-            if server_cfg_details.get("command"):
-                args_info = (
-                    f" with args: {server_cfg_details['args']}"
-                    if server_cfg_details.get("args")
-                    else ""
-                )
-                logger.info(
-                    f"  Configuring Stdio MCP Server '{server_name_cfg}' with command: {server_cfg_details['command']}{args_info}"
-                )
-            elif server_cfg_details.get("type") == "sse" and server_cfg_details.get(
-                "url"
-            ):
-                logger.info(
-                    f"  Configuring SSE MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
-                )
-            elif (
-                server_cfg_details.get("type") == "streamablehttp"
-                or server_cfg_details.get("type") == "streamable_http"
-            ) and server_cfg_details.get("url"):
-                logger.info(
-                    f"  Configuring StreamableHTTP MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
-                )
-            elif server_cfg_details.get("url"):  # Fallback for old SSE config
-                logger.info(
-                    f"  Configuring SSE (fallback) MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
-                )
-            else:
-                logger.warning(
-                    f"  Unknown configuration for MCP server: {server_name_cfg}"
-                )
-
-        main_app.description += "\n\n- **available tools**："
+        logger.info("Configuring MCP Servers:")
         for server_name, server_cfg in mcp_servers.items():
             sub_app = FastAPI(
                 title=f"{server_name}",
@@ -321,35 +317,30 @@ async def run(
             server_config_type = server_cfg.get("type")
             if server_config_type == "sse" and server_cfg.get("url"):
                 sub_app.state.server_type = "sse"
-                sub_app.state.args = server_cfg["url"]
+                sub_app.state.args = [server_cfg["url"]]
                 sub_app.state.headers = server_cfg.get("headers")
             elif (
                 server_config_type == "streamablehttp"
                 or server_config_type == "streamable_http"
             ) and server_cfg.get("url"):
-                # Store the URL with trailing slash to avoid redirects
                 url = server_cfg["url"]
                 if not url.endswith("/"):
                     url = f"{url}/"
                 sub_app.state.server_type = "streamablehttp"
-                sub_app.state.args = url
+                sub_app.state.args = [url]
                 sub_app.state.headers = server_cfg.get("headers")
-
-            elif not server_config_type and server_cfg.get(
-                "url"
-            ):  # Fallback for old SSE config
+            elif not server_config_type and server_cfg.get("url"):  # Fallback for old SSE config
                 sub_app.state.server_type = "sse"
-                sub_app.state.args = server_cfg["url"]
+                sub_app.state.args = [server_cfg["url"]]
                 sub_app.state.headers = server_cfg.get("headers")
 
-            # Add middleware to protect also documentation and spec
             if api_key and strict_auth:
                 sub_app.add_middleware(APIKeyMiddleware, api_key=api_key)
 
             sub_app.state.api_dependency = api_dependency
+            sub_app.state.connection_timeout = connection_timeout
 
             main_app.mount(f"{path_prefix}{server_name}", sub_app)
-            main_app.description += f"\n    - [{server_name}](/{server_name}/docs)"
     else:
         logger.error("MCPO server_command or config_path must be provided.")
         raise ValueError("You must provide either server_command or config.")
@@ -365,9 +356,16 @@ async def run(
     )
     server = uvicorn.Server(config)
 
+    # Add signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, server.handle_exit, sig, None)
+
     try:
         await server.serve()
-    except asyncio.CancelledError:
-        server.should_exit = True
-        await server.shutdown()
-        raise 
+    finally:
+        # This part may not be strictly necessary with modern uvicorn,
+        # but it ensures cleanup happens.
+        if server.should_exit and not server.started:
+            await server.shutdown()
+        raise

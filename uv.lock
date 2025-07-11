@@ -313,7 +313,7 @@ cli = [
 
 [[package]]
 name = "mcpo"
-version = "0.0.14"
+version = "0.0.16"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
