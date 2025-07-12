@@ -89,7 +89,7 @@ async def lifespan(app: FastAPI):
     command = getattr(app.state, "command", None)
     args = getattr(app.state, "args", [])
     env = getattr(app.state, "env", {})
-    connection_timeout = getattr(app.state, "connection_timeout", 10)
+    connection_timeout = getattr(app.state, "connection_timeout", 5)
     api_dependency = getattr(app.state, "api_dependency", None)
 
     # This is the main app's lifespan, it orchestrates sub-apps
