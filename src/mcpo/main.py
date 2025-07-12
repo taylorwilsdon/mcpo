@@ -4,7 +4,7 @@ import logging
 import signal
 import socket
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from typing import Optional
 
 import uvicorn
@@ -17,6 +17,22 @@ from mcp.client.streamable_http import streamablehttp_client
 from starlette.routing import Mount
 
 logger = logging.getLogger(__name__)
+
+
+class GracefulShutdown:
+    def __init__(self):
+        self.shutdown_event = asyncio.Event()
+        self.tasks = set()
+
+    def handle_signal(self, sig, frame=None):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"\nReceived {signal.Signals(sig).name}, initiating graceful shutdown...")
+        self.shutdown_event.set()
+
+    def track_task(self, task):
+        """Track tasks for cleanup"""
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
 
 
 from mcpo.utils.main import get_model_fields, get_tool_handler
@@ -83,6 +99,8 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         )(tool_handler)
 
 
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     server_type = getattr(app.state, "server_type", "stdio")
@@ -92,7 +110,9 @@ async def lifespan(app: FastAPI):
     connection_timeout = getattr(app.state, "connection_timeout", 5)
     api_dependency = getattr(app.state, "api_dependency", None)
 
-    # This is the main app's lifespan, it orchestrates sub-apps
+    # Get shutdown handler from app state
+    shutdown_handler = getattr(app.state, "shutdown_handler", None)
+
     is_main_app = not command and not (server_type in ["sse", "streamablehttp", "streamable_http"] and args)
 
     if is_main_app:
@@ -157,39 +177,36 @@ async def lifespan(app: FastAPI):
             # when the 'with' block is exited.
     else:
         # This is a sub-app's lifespan
-        # This is a sub-app's lifespan
         app.state.is_connected = False
         try:
-            # Wrap the entire connection attempt in a timeout
-            async with asyncio.timeout(connection_timeout):
-                if server_type == "stdio":
-                    server_params = StdioServerParameters(
-                        command=command,
-                        args=args,
-                        env={**os.environ, **env},
-                    )
-                    client_context = stdio_client(server_params)
-                elif server_type == "sse":
-                    headers = getattr(app.state, "headers", None)
-                    client_context = sse_client(
-                        url=args[0], sse_read_timeout=connection_timeout, headers=headers
-                    )
-                elif server_type == "streamablehttp" or server_type == "streamable_http":
-                    headers = getattr(app.state, "headers", None)
-                    client_context = streamablehttp_client(url=args[0], headers=headers)
-                else:
-                    raise ValueError(f"Unsupported server type: {server_type}")
+            if server_type == "stdio":
+                server_params = StdioServerParameters(
+                    command=command,
+                    args=args,
+                    env={**os.environ, **env},
+                )
+                client_context = stdio_client(server_params)
+            elif server_type == "sse":
+                headers = getattr(app.state, "headers", None)
+                client_context = sse_client(
+                    url=args[0], sse_read_timeout=connection_timeout, headers=headers
+                )
+            elif server_type == "streamablehttp" or server_type == "streamable_http":
+                headers = getattr(app.state, "headers", None)
+                client_context = streamablehttp_client(url=args[0], headers=headers)
+            else:
+                raise ValueError(f"Unsupported server type: {server_type}")
 
-                async with client_context as (reader, writer, *_):
-                    async with ClientSession(reader, writer) as session:
-                        app.state.session = session
-                        await create_dynamic_endpoints(app, api_dependency=api_dependency)
-                        app.state.is_connected = True
-                        yield
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.error(f"Failed to connect to MCP server '{app.title}' (timeout: {connection_timeout}s): {e}")
+            async with client_context as (reader, writer, *_):
+                async with ClientSession(reader, writer) as session:
+                    app.state.session = session
+                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
+                    app.state.is_connected = True
+                    yield
+        except Exception as e:
+            logger.error(f"Failed to connect to MCP server '{app.title}': {e}")
             app.state.is_connected = False
-            return # Correctly exit the generator
+            return
 
 
 async def run(
@@ -228,6 +245,18 @@ async def run(
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
+    
+    # Suppress HTTP request logs
+    class HTTPRequestFilter(logging.Filter):
+        def filter(self, record):
+            return not (
+                record.levelname == "INFO" and 
+                "HTTP Request:" in record.getMessage()
+            )
+    
+    # Apply filter to suppress HTTP request logs
+    logging.getLogger().addFilter(HTTPRequestFilter())
+    logging.getLogger("httpx").addFilter(HTTPRequestFilter())
     logger.info("Starting MCPO Server...")
     logger.info(f"  Name: {name}")
     logger.info(f"  Version: {version}")
@@ -242,6 +271,9 @@ async def run(
         logger.info(f"  SSL Key File: {ssl_keyfile}")
     logger.info(f"  Path Prefix: {path_prefix}")
 
+    # Create shutdown handler
+    shutdown_handler = GracefulShutdown()
+
     main_app = FastAPI(
         title=name,
         description=description,
@@ -250,6 +282,9 @@ async def run(
         ssl_keyfile=ssl_keyfile,
         lifespan=lifespan,
     )
+
+    # Pass shutdown handler to app state
+    main_app.state.shutdown_handler = shutdown_handler
 
     main_app.add_middleware(
         CORSMiddleware,
@@ -372,16 +407,37 @@ async def run(
     )
     server = uvicorn.Server(config)
 
-    # Add signal handlers for graceful shutdown
+    # Setup signal handlers
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, server.handle_exit, sig, None)
+        loop.add_signal_handler(
+            sig,
+            lambda s=sig: shutdown_handler.handle_signal(s)
+        )
 
+    # Modified server startup
     try:
-        await server.serve()
+        # Create server task
+        server_task = asyncio.create_task(server.serve())
+        shutdown_handler.track_task(server_task)
+
+        # Wait for shutdown signal
+        await shutdown_handler.shutdown_event.wait()
+
+        # Graceful shutdown
+        logger.info("Initiating server shutdown...")
+        server.should_exit = True
+
+        # Cancel all tracked tasks
+        for task in list(shutdown_handler.tasks):
+            if not task.done():
+                task.cancel()
+
+        # Wait for all tasks to complete
+        if shutdown_handler.tasks:
+            await asyncio.gather(*shutdown_handler.tasks, return_exceptions=True)
+
+    except Exception as e:
+        logger.error(f"Error during server execution: {e}")
     finally:
-        # This part may not be strictly necessary with modern uvicorn,
-        # but it ensures cleanup happens.
-        if server.should_exit and not server.started:
-            await server.shutdown()
-        raise
+        logger.info("Server shutdown complete")
