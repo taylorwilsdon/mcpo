@@ -27,7 +27,9 @@ class GracefulShutdown:
 
     def handle_signal(self, sig, frame=None):
         """Handle shutdown signals gracefully"""
-        logger.info(f"\nReceived {signal.Signals(sig).name}, initiating graceful shutdown...")
+        logger.info(
+            f"\nReceived {signal.Signals(sig).name}, initiating graceful shutdown..."
+        )
         self.shutdown_event.set()
 
     def track_task(self, task):
@@ -100,8 +102,6 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         )(tool_handler)
 
 
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     server_type = getattr(app.state, "server_type", "stdio")
@@ -116,7 +116,9 @@ async def lifespan(app: FastAPI):
     # Get shutdown handler from app state
     shutdown_handler = getattr(app.state, "shutdown_handler", None)
 
-    is_main_app = not command and not (server_type in ["sse", "streamablehttp", "streamable_http"] and args)
+    is_main_app = not command and not (
+        server_type in ["sse", "streamablehttp", "streamable_http"] and args
+    )
 
     if is_main_app:
         async with AsyncExitStack() as stack:
@@ -139,10 +141,14 @@ async def lifespan(app: FastAPI):
                         logger.info(f"Successfully connected to '{server_name}'.")
                         successful_servers.append(server_name)
                     else:
-                        logger.warning(f"Connection attempt for '{server_name}' finished, but status is not 'connected'.")
+                        logger.warning(
+                            f"Connection attempt for '{server_name}' finished, but status is not 'connected'."
+                        )
                         failed_servers.append(server_name)
                 except Exception:
-                    logger.error(f"Failed to establish connection for server: '{server_name}'.")
+                    logger.error(
+                        f"Failed to establish connection for server: '{server_name}'."
+                    )
                     failed_servers.append(server_name)
 
             logger.info("\n--- Server Startup Summary ---")
@@ -180,7 +186,9 @@ async def lifespan(app: FastAPI):
             elif server_type == "sse":
                 headers = getattr(app.state, "headers", None)
                 client_context = sse_client(
-                    url=args[0], sse_read_timeout=connection_timeout or 900, headers=headers
+                    url=args[0],
+                    sse_read_timeout=connection_timeout or 900,
+                    headers=headers,
                 )
             elif server_type == "streamablehttp" or server_type == "streamable_http":
                 headers = getattr(app.state, "headers", None)
@@ -241,8 +249,7 @@ async def run(
     class HTTPRequestFilter(logging.Filter):
         def filter(self, record):
             return not (
-                record.levelname == "INFO" and
-                "HTTP Request:" in record.getMessage()
+                record.levelname == "INFO" and "HTTP Request:" in record.getMessage()
             )
 
     # Apply filter to suppress HTTP request logs
@@ -372,7 +379,9 @@ async def run(
                 sub_app.state.server_type = "streamablehttp"
                 sub_app.state.args = [url]
                 sub_app.state.headers = server_cfg.get("headers")
-            elif not server_config_type and server_cfg.get("url"):  # Fallback for old SSE config
+            elif not server_config_type and server_cfg.get(
+                "url"
+            ):  # Fallback for old SSE config
                 sub_app.state.server_type = "sse"
                 sub_app.state.args = [server_cfg["url"]]
                 sub_app.state.headers = server_cfg.get("headers")
@@ -404,11 +413,12 @@ async def run(
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(
-                sig,
-                lambda s=sig: shutdown_handler.handle_signal(s)
+                sig, lambda s=sig: shutdown_handler.handle_signal(s)
             )
     except NotImplementedError:
-        logger.warning("loop.add_signal_handler is not available on this platform. Using signal.signal().")
+        logger.warning(
+            "loop.add_signal_handler is not available on this platform. Using signal.signal()."
+        )
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda s, f: shutdown_handler.handle_signal(s))
 
