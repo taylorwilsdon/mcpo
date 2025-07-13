@@ -107,6 +107,7 @@ async def lifespan(app: FastAPI):
     server_type = getattr(app.state, "server_type", "stdio")
     command = getattr(app.state, "command", None)
     args = getattr(app.state, "args", [])
+    args = args if isinstance(args, list) else [args]
     env = getattr(app.state, "env", {})
     connection_timeout = getattr(app.state, "connection_timeout", 10)
     api_dependency = getattr(app.state, "api_dependency", None)
@@ -122,40 +123,27 @@ async def lifespan(app: FastAPI):
             successful_servers = []
             failed_servers = []
 
-            async def start_server(route: Mount):
-                """Helper to start a server and capture its status."""
-                server_name = route.app.title
-                logger.info(f"Initiating connection for server: '{server_name}'...")
-                try:
-                    await stack.enter_async_context(
-                        route.app.router.lifespan_context(route.app)
-                    )
-                    is_connected = getattr(route.app.state, "is_connected", False)
-                    if is_connected:
-                        logger.info(f"Successfully connected to '{server_name}'.")
-                        return server_name, True
-                    else:
-                        # This case might happen if the connection fails inside the sub-lifespan without an exception
-                        logger.warning(f"Connection attempt for '{server_name}' finished, but status is not 'connected'.")
-                        return server_name, False
-                except Exception:
-                    # The specific error is already logged in the sub-app's lifespan
-                    logger.error(f"Failed to establish connection for server: '{server_name}'.")
-                    return server_name, False
-
-            tasks = [
-                start_server(route)
+            sub_lifespans = [
+                (route.app, route.app.router.lifespan_context(route.app))
                 for route in app.routes
                 if isinstance(route, Mount) and isinstance(route.app, FastAPI)
             ]
 
-            if tasks:
-                results = await asyncio.gather(*tasks)
-                for name, is_connected in results:
+            for sub_app, lifespan_context in sub_lifespans:
+                server_name = sub_app.title
+                logger.info(f"Initiating connection for server: '{server_name}'...")
+                try:
+                    await stack.enter_async_context(lifespan_context)
+                    is_connected = getattr(sub_app.state, "is_connected", False)
                     if is_connected:
-                        successful_servers.append(name)
+                        logger.info(f"Successfully connected to '{server_name}'.")
+                        successful_servers.append(server_name)
                     else:
-                        failed_servers.append(name)
+                        logger.warning(f"Connection attempt for '{server_name}' finished, but status is not 'connected'.")
+                        failed_servers.append(server_name)
+                except Exception:
+                    logger.error(f"Failed to establish connection for server: '{server_name}'.")
+                    failed_servers.append(server_name)
 
             logger.info("\n--- Server Startup Summary ---")
             if successful_servers:
@@ -258,8 +246,8 @@ async def run(
             )
 
     # Apply filter to suppress HTTP request logs
-    logging.getLogger().addFilter(HTTPRequestFilter())
-    logging.getLogger("httpx").addFilter(HTTPRequestFilter())
+    logging.getLogger("uvicorn.access").addFilter(HTTPRequestFilter())
+    logging.getLogger("httpx.access").addFilter(HTTPRequestFilter())
     logger.info("Starting MCPO Server...")
     logger.info(f"  Name: {name}")
     logger.info(f"  Version: {version}")
