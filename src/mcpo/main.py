@@ -4,8 +4,9 @@ import logging
 import signal
 import socket
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
+from urllib.parse import urljoin
 
 import uvicorn
 from fastapi import Depends, FastAPI
@@ -109,6 +110,7 @@ async def lifespan(app: FastAPI):
     env = getattr(app.state, "env", {})
     connection_timeout = getattr(app.state, "connection_timeout", 5)
     api_dependency = getattr(app.state, "api_dependency", None)
+    path_prefix = getattr(app.state, "path_prefix", "/")
 
     # Get shutdown handler from app state
     shutdown_handler = getattr(app.state, "shutdown_handler", None)
@@ -162,7 +164,8 @@ async def lifespan(app: FastAPI):
                     logger.info(f"  - {name}")
                 app.description += "\n\n- **available tools**："
                 for name in successful_servers:
-                    app.description += f"\n    - [{name}](/{name}/docs)"
+                    docs_path = urljoin(path_prefix, f"{name}/docs")
+                    app.description += f"\n    - [{name}]({docs_path})"
             if failed_servers:
                 logger.warning("Failed to connect to:")
                 for name in failed_servers:
@@ -189,7 +192,7 @@ async def lifespan(app: FastAPI):
             elif server_type == "sse":
                 headers = getattr(app.state, "headers", None)
                 client_context = sse_client(
-                    url=args[0], sse_read_timeout=connection_timeout, headers=headers
+                    url=args[0], sse_read_timeout=connection_timeout or 900, headers=headers
                 )
             elif server_type == "streamablehttp" or server_type == "streamable_http":
                 headers = getattr(app.state, "headers", None)
@@ -218,7 +221,7 @@ async def run(
 ):
     # Server API Key
     api_dependency = get_verify_api_key(api_key) if api_key else None
-    connection_timeout = kwargs.get("connection_timeout", 10)
+    connection_timeout = kwargs.get("connection_timeout", None)
     strict_auth = kwargs.get("strict_auth", False)
 
     # MCP Server
@@ -245,15 +248,15 @@ async def run(
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
-    
+
     # Suppress HTTP request logs
     class HTTPRequestFilter(logging.Filter):
         def filter(self, record):
             return not (
-                record.levelname == "INFO" and 
+                record.levelname == "INFO" and
                 "HTTP Request:" in record.getMessage()
             )
-    
+
     # Apply filter to suppress HTTP request logs
     logging.getLogger().addFilter(HTTPRequestFilter())
     logging.getLogger("httpx").addFilter(HTTPRequestFilter())
@@ -285,6 +288,7 @@ async def run(
 
     # Pass shutdown handler to app state
     main_app.state.shutdown_handler = shutdown_handler
+    main_app.state.path_prefix = path_prefix
 
     main_app.add_middleware(
         CORSMiddleware,
@@ -408,12 +412,17 @@ async def run(
     server = uvicorn.Server(config)
 
     # Setup signal handlers
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            sig,
-            lambda s=sig: shutdown_handler.handle_signal(s)
-        )
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: shutdown_handler.handle_signal(s)
+            )
+    except NotImplementedError:
+        logger.warning("loop.add_signal_handler is not available on this platform. Using signal.signal().")
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda s, f: shutdown_handler.handle_signal(s))
 
     # Modified server startup
     try:
@@ -421,8 +430,20 @@ async def run(
         server_task = asyncio.create_task(server.serve())
         shutdown_handler.track_task(server_task)
 
-        # Wait for shutdown signal
-        await shutdown_handler.shutdown_event.wait()
+        # Wait for either the server to fail or a shutdown signal
+        shutdown_wait_task = asyncio.create_task(shutdown_handler.shutdown_event.wait())
+        done, pending = await asyncio.wait(
+            [server_task, shutdown_wait_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if server_task in done:
+            logger.warning("Server task exited unexpectedly. Initiating shutdown.")
+            shutdown_handler.shutdown_event.set()
+
+        # Cancel the other task
+        for task in pending:
+            task.cancel()
 
         # Graceful shutdown
         logger.info("Initiating server shutdown...")
