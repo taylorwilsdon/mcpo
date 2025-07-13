@@ -108,7 +108,7 @@ async def lifespan(app: FastAPI):
     command = getattr(app.state, "command", None)
     args = getattr(app.state, "args", [])
     env = getattr(app.state, "env", {})
-    connection_timeout = getattr(app.state, "connection_timeout", 5)
+    connection_timeout = getattr(app.state, "connection_timeout", 10)
     api_dependency = getattr(app.state, "api_dependency", None)
     path_prefix = getattr(app.state, "path_prefix", "/")
 
